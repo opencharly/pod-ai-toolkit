@@ -1,0 +1,303 @@
+ai-toolkit:
+    candy:
+        description: |
+            Ostris AI Toolkit diffusion-model training server — the GUI on port 8675 plus the CLI trainer
+            (`ai-toolkit-train <config.yml>`). Clones ai-toolkit at a PINNED COMMIT (upstream publishes no
+            tags at all, so a commit is the only pinnable ref), builds its runtime venv at image-build time
+            from that commit's own requirements.txt against the pinned torch cu130 wheel index, builds the
+            Next.js UI, and supervises the UI server and its job worker as two services. The mutable state —
+            configs, datasets, output — lives in the `ai-toolkit` volume; the application stays in the image
+            at /opt/ai-toolkit. Ships a Z-Image LoRA example config that trains on ostris/Z-Image-De-Turbo
+            and infers on Tongyi-MAI/Z-Image-Turbo. Each piece is verifiable: the cloned tree at the pinned
+            commit, a venv torch that reports a CUDA device, a diffusers whose ZImagePipeline exists, the
+            built UI entrypoints, the example config, and the live UI on port 8675.
+        require:
+            # CUDA runtime: ai-toolkit drives an NVIDIA GPU for every job.
+            - '@github.com/opencharly/layer-cuda:v2026.314.0705'
+            - '@github.com/opencharly/layer-supervisord:v2026.314.0710'
+            # Node >= 20 for the Next.js UI (built at image time, run by the services).
+            - '@github.com/opencharly/layer-nodejs:v2026.314.0707'
+        env:
+            # Upstream publishes NO tags (git ls-remote --tags returns none), so the pin is a commit.
+            AI_TOOLKIT_REF: d6a18ad72da9abca3ffb67ea8e42c25764eee61a
+            AI_TOOLKIT_PORT: "8675"
+            # The two Z-Image bases this pod is proven with. Declared HERE because the shipped example
+            # config hard-requires both: training needs the de-distilled CFG-capable base, and the text
+            # encoder / tokenizer / VAE come from the Turbo diffusers repo (De-Turbo carries none).
+            AI_TOOLKIT_TRAIN_BASE: ostris/Z-Image-De-Turbo
+            AI_TOOLKIT_TEXT_ENCODER_BASE: Tongyi-MAI/Z-Image-Turbo
+            # Where a finished LoRA lands. This is the SAME host directory pod-comfyui mounts at
+            # models/loras, so a trained LoRA is loadable in ComfyUI with no copy step.
+            AI_TOOLKIT_LORA_DIR: /workspace/shared-loras
+        env_accept:
+            - name: AI_TOOLKIT_REF
+              description: "ai-toolkit commit to build (default: the commit this candy is proven with)."
+            - name: AI_TOOLKIT_AUTH
+              description: "Optional UI auth token (upstream AI_TOOLKIT_AUTH). UNSET by default: the pod is expected to be reached over a loopback or tailnet binding, and an unset token keeps the UI open only to whoever can reach the port."
+        distro:
+            arch:
+                package:
+                    - git
+                    - curl
+                    - ffmpeg
+            fedora:
+                package:
+                    - git
+                    - curl
+                    - ffmpeg
+        port:
+            - 8675
+        volume:
+            # Mutable state: configs/, datasets/, output/. The application lives in the image.
+            - name: ai-toolkit
+              path: "~/ai-toolkit"
+            # A plain workspace volume so the pod is self-consistent on its own. Pairing with
+            # pod-comfyui REPLACES /workspace/shared-loras with a host bind of the directory the
+            # ComfyUI pod mounts at models/loras — a nested mount over this volume.
+            - name: workspace
+              path: "/workspace"
+        service:
+            # TWO services, not one `concurrently` wrapper: the UI server and its job worker fail
+            # and restart independently, and supervisord tracks two real PIDs instead of one wrapper
+            # that would leave an untracked grandchild behind (measured in this org on unsloth-studio).
+            - name: ai-toolkit-ui
+              exec: /opt/ai-toolkit/start-ui.sh
+              restart: always
+              working_directory: /opt/ai-toolkit/ui
+              enable: true
+              scope: system
+              priority: 20
+            - name: ai-toolkit-worker
+              exec: /opt/ai-toolkit/start-worker.sh
+              restart: always
+              working_directory: /opt/ai-toolkit/ui
+              enable: true
+              scope: system
+              priority: 10
+        plan:
+            - run: clone ai-toolkit at the pinned COMMIT into the image-owned app directory
+              run_as: root
+              command: |
+                set -eu
+                git clone --filter=blob:none https://github.com/ostris/ai-toolkit.git /opt/ai-toolkit
+                cd /opt/ai-toolkit
+                git checkout --detach "${AI_TOOLKIT_REF:?AI_TOOLKIT_REF must be declared by the candy}"
+                # a detached checkout at a pin is only trustworthy if the pin RESOLVED — a typo'd
+                # sha leaves the clone on the default branch and the build would ship the wrong code
+                test "$(git rev-parse HEAD)" = "${AI_TOOLKIT_REF}"
+                printf '%s\n' "${AI_TOOLKIT_REF}" > /opt/ai-toolkit/.charly-ref
+
+            - run: build the ai-toolkit runtime venv from its own pinned requirements against torch cu130
+              # ai-toolkit ships a pinned requirements set that includes a GIT revision of diffusers;
+              # it is solved as a unit by upstream and re-solved on upstream's cadence, so the venv is
+              # built from that exact file rather than re-expressed in pixi (same shape pod-unsloth-studio
+              # uses for the Unsloth Studio runtime venv). pixi owns the PYTHON MINOR VERSION only.
+              run_as: root
+              cache:
+                - /root/.cache/pip
+              command: |
+                set -eu
+                cd /opt/ai-toolkit
+                python3 -m venv venv
+                ./venv/bin/python -m pip install --upgrade pip wheel setuptools
+                ./venv/bin/pip install --no-cache-dir \
+                  torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
+                  --index-url https://download.pytorch.org/whl/cu130
+                ./venv/bin/pip install --no-cache-dir -r requirements.txt
+                # fail the build loudly: a silently broken venv would only surface as a
+                # supervisord FATAL at deploy time
+                ./venv/bin/python -c "import torch; print('torch', torch.__version__)"
+
+            - run: build the Next.js UI so the supervised launch is immediate
+              run_as: root
+              cache:
+                - /root/.npm
+              command: |
+                set -eu
+                cd /opt/ai-toolkit/ui
+                npm ci
+                npm run build
+                test -s dist/cron/fileServer.js
+                test -s dist/cron/worker.js
+
+            - run: hand the app tree to the image user so the UI can write its own runtime state
+              run_as: root
+              command: |
+                set -eu
+                chown -R "${UID}:${GID}" /opt/ai-toolkit
+
+            - run: keep the upstream example configs aside — the live config dir becomes a volume symlink
+              run_as: root
+              command: |
+                set -eu
+                # The runtime seeds <volume>/config from this snapshot and then symlinks
+                # /opt/ai-toolkit/config at the volume, so upstream examples survive a volume wipe
+                # without the app dir being writable-as-state.
+                if [ -d /opt/ai-toolkit/config ]; then
+                  cp -a /opt/ai-toolkit/config /opt/ai-toolkit/config.examples
+                else
+                  mkdir -p /opt/ai-toolkit/config.examples
+                fi
+
+            - run: install the shipped Z-Image LoRA example config
+              copy: configs/z-image-lora-de-turbo.yml
+              to: /opt/ai-toolkit/config.examples/z-image-lora-de-turbo.yml
+              mode: "0644"
+              run_as: root
+
+            - run: write the CLI trainer wrapper so a job never depends on which python is first on PATH
+              write: /usr/local/bin/ai-toolkit-train
+              mode: "0755"
+              run_as: root
+              content: |
+                #!/bin/bash
+                # Run ai-toolkit with ITS OWN venv, from ITS OWN root, regardless of the caller's PATH
+                # or cwd — the UI worker resolves the venv itself, but a human or an agent running the
+                # CLI should get the same interpreter.
+                set -eu
+                export AI_TOOLKIT_ROOT=/opt/ai-toolkit
+                cd /opt/ai-toolkit
+                exec /opt/ai-toolkit/venv/bin/python /opt/ai-toolkit/run.py "$@"
+
+            - run: write the start script that seeds the state volume, links it in, then execs the UI server
+              write: /opt/ai-toolkit/start-ui.sh
+              mode: "0755"
+              run_as: root
+              content: |
+                #!/bin/bash
+                set -eu
+                # The APPLICATION lives in the image (/opt/ai-toolkit, pinned commit); the MUTABLE
+                # directories live in the `ai-toolkit` volume. ai-toolkit has no --base-directory flag
+                # (ComfyUI does), so the volume is spliced in by SYMLINK, created at RUNTIME because the
+                # volume only exists once the container starts.
+                BASE="${HOME}/ai-toolkit"
+                mkdir -p "${BASE}"/{config,output,datasets}
+                # share the LoRA shelf with the ComfyUI pod when one is mounted
+                mkdir -p "${AI_TOOLKIT_LORA_DIR:-/workspace/shared-loras}"
+                # seed the config dir from the image snapshot exactly once
+                if [ -d /opt/ai-toolkit/config.examples ]; then
+                  cp -an /opt/ai-toolkit/config.examples/. "${BASE}/config/" 2>/dev/null || true
+                fi
+                for d in config output datasets; do
+                  if [ -e "/opt/ai-toolkit/${d}" ] && [ ! -L "/opt/ai-toolkit/${d}" ]; then
+                    rm -rf "/opt/ai-toolkit/${d}"
+                  fi
+                  ln -sfn "${BASE}/${d}" "/opt/ai-toolkit/${d}"
+                done
+                export AI_TOOLKIT_AUTH="${AI_TOOLKIT_AUTH:-}"
+                cd /opt/ai-toolkit/ui
+                exec node dist/cron/fileServer.js start --port "${AI_TOOLKIT_PORT:-8675}"
+
+            - run: write the start script for the job worker
+              write: /opt/ai-toolkit/start-worker.sh
+              mode: "0755"
+              run_as: root
+              content: |
+                #!/bin/bash
+                set -eu
+                # The worker is what actually launches `python run.py <config>` for a queued job. It
+                # resolves the interpreter from <root>/venv/bin/python, which is exactly where the
+                # build put it — so it must see the SAME symlinked app tree the UI does.
+                BASE="${HOME}/ai-toolkit"
+                mkdir -p "${BASE}"/{config,output,datasets}
+                for d in config output datasets; do
+                  if [ -e "/opt/ai-toolkit/${d}" ] && [ ! -L "/opt/ai-toolkit/${d}" ]; then
+                    rm -rf "/opt/ai-toolkit/${d}"
+                  fi
+                  ln -sfn "${BASE}/${d}" "/opt/ai-toolkit/${d}"
+                done
+                cd /opt/ai-toolkit/ui
+                exec node dist/cron/worker.js
+
+            - check: the source tree is the PINNED commit, not whatever the default branch was that day
+              id: ai-toolkit-pinned-ref
+              command: |
+                set -eu
+                test -s /opt/ai-toolkit/.charly-ref
+                test "$(cat /opt/ai-toolkit/.charly-ref)" = "$(git -C /opt/ai-toolkit rev-parse HEAD)"
+              exit_status: 0
+
+            - check: the venv imports torch and the build-time CUDA stack
+              id: ai-toolkit-venv-torch
+              stdout:
+                - contains: torch
+              command: /opt/ai-toolkit/venv/bin/python -c "import torch; print('torch', torch.__version__)"
+              exit_status: 0
+
+            - check: the pinned diffusers actually carries ZImagePipeline — the whole Z-Image path depends on it
+              # This is the contract that makes or breaks every Z-Image job, and it is a property of the
+              # diffusers REVISION ai-toolkit pins (a git dependency), not of anything this candy installs.
+              id: ai-toolkit-diffusers-zimage
+              stdout:
+                - contains: ZImagePipeline
+              command: /opt/ai-toolkit/venv/bin/python -c "from diffusers import ZImagePipeline; print('ZImagePipeline')"
+              exit_status: 0
+
+            - check: the Z-Image model handler ai-toolkit will use for arch=zimage is importable
+              id: ai-toolkit-zimage-handler
+              stdout:
+                - contains: zimage
+              command: /opt/ai-toolkit/venv/bin/python -c "from extensions_built_in.diffusion_models.z_image.z_image import ZImageModel; print(ZImageModel.arch)"
+              exit_status: 0
+
+            - check: the UI was built, so the supervised launch does not build anything at start
+              id: ai-toolkit-ui-built
+              file:
+                file: /opt/ai-toolkit/ui/dist/cron/fileServer.js
+                exists: true
+
+            - check: the shipped Z-Image LoRA example config is present in the image
+              id: ai-toolkit-zimage-config
+              file:
+                file: /opt/ai-toolkit/config.examples/z-image-lora-de-turbo.yml
+                exists: true
+
+            - check: the CLI trainer wrapper execs the venv
+              id: ai-toolkit-train-wrapper
+              file:
+                file: /usr/local/bin/ai-toolkit-train
+                exists: true
+                mode: "0755"
+
+            - check: the live UI answers on the toolkit port
+              id: ai-toolkit-ui-live
+              context:
+                - runtime
+              # cold boot is fast (nothing is built or downloaded at start), but the Next.js server
+              # still needs a moment to bind
+              eventually: 3m
+              retry_interval: 5s
+              http:
+                http: http://127.0.0.1:${HOST_PORT:8675}/
+                status: 200
+
+            - check: the state tree is SPLICED into the volume, not left in the image
+              id: ai-toolkit-state-in-volume
+              context:
+                - runtime
+              command: |
+                set -eu
+                for d in config output datasets; do
+                  test -L "/opt/ai-toolkit/$d" || { echo "/opt/ai-toolkit/$d is not a volume symlink" >&2; exit 1; }
+                  test -d "$HOME/ai-toolkit/$d" || { echo "$HOME/ai-toolkit/$d is missing" >&2; exit 1; }
+                done
+              exit_status: 0
+
+
+ai-toolkit-skill:
+    skill:
+        name: ai-toolkit
+        family: ai-toolkit
+        owner: ai-toolkit
+        description: |-
+            Ostris AI Toolkit diffusion training pod (GUI 8675 + CLI trainer), and the Z-Image LoRA path.
+            MUST be invoked before building, deploying, configuring, or troubleshooting the ai-toolkit pod.
+
+# The verb/schema skills this repo's own candy owns — routing only. The prose is the skill FILE at
+# `<repo root>/.agents/skills/<name>/SKILL.md`, never an inline description: an inline body that
+# disagrees with its file is a hard error in the marketplace generator.
+ai-toolkit-layer-skill:
+    skill:
+        name: ai-toolkit-layer
+        family: ai-toolkit
+        owner: ai-toolkit

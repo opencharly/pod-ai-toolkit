@@ -1,0 +1,122 @@
+# Z-Image LoRA — the shipped example config for this pod.
+#
+# TRAIN on the DE-TURBO base, INFER on Z-Image-Turbo. That split is deliberate,
+# not an oversight:
+#
+#   * Tongyi-MAI/Z-Image-Turbo is a Decoupled-DMD distilled checkpoint (8 NFEs,
+#     guidance 0, CFG disabled). Its own model card rates its fine-tunability as
+#     "N/A" — distillation baked the sampler into the weights, which is exactly
+#     what makes a LoRA hard to steer.
+#   * ostris/Z-Image-De-Turbo is that same model de-distilled back to a CFG-using
+#     base. ai-toolkit trains it normally, and the resulting LoRA applies to the
+#     Turbo checkpoint at inference.
+#
+# ai-toolkit publishes NO Z-Image example config (verified at the pinned commit),
+# so this file is authored against the model handler's own contract:
+# extensions_built_in/diffusion_models/z_image/z_image.py. Two fields are load-
+# bearing and are NOT guessable:
+#
+#   arch                    must be "zimage" (ZImageModel.arch)
+#   extras_name_or_path     REQUIRED here. De-Turbo ships transformer/ + a
+#                           single-file, but NO text_encoder/ and NO vae/ — so the
+#                           handler cannot use it as its own base model path and
+#                           would fail to load the Qwen3 text encoder and the
+#                           KLVAE. Point it at the Turbo diffusers repo, which is
+#                           a complete pipeline (text_encoder/, vae/, tokenizer/).
+#
+# Dataset layout: a folder of images with a same-named .txt caption beside each.
+# The word [trigger] in a caption is replaced by trigger_word.
+
+---
+job: extension
+config:
+  # the folder AND filename name under training_folder
+  name: "zimage_lora_v1"
+  process:
+    - type: 'sd_trainer'
+
+      # ABSOLUTE, and it points into the shared LoRA shelf on purpose: this is the
+      # directory pod-comfyui mounts at models/loras, so a finished LoRA is
+      # loadable in ComfyUI with no copy step. Override per job if you train
+      # elsewhere.
+      training_folder: "/workspace/shared-loras"
+
+      device: cuda:0
+
+      # every [trigger] in a caption is replaced by this; the word is also added
+      # to captions that do not contain it
+      trigger_word: "zstyle"
+
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+        # Narrow the trained surface if you want a smaller, more surgical LoRA.
+        # The layer names are diffusers-format (ZImageTransformer2DModel):
+        #   network_kwargs:
+        #     only_if_contains:
+        #       - "transformer.layers."
+
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+
+      datasets:
+        - folder_path: "/workspace/ai-toolkit/datasets/my-dataset"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          # the handler's bucket divisibility is 16 (8 for the VAE, 2 for patch
+          # size), so every resolution here is a multiple of 16
+          resolution: [ 512, 768, 1024 ]
+
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation_steps: 1
+        train_unet: true
+        train_text_encoder: false
+        # REQUIRED on a 16 GB card: a 6B DiT does not fit without it
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+        # cache_text_embeddings: true is the 24 GB-and-under knob in the upstream
+        # examples; it is OFF by default here because the pinned ai-toolkit raises
+        # on it unless every dataset row has a caption. Turn it on once your
+        # captions are complete — it is a large VRAM saving.
+        # cache_text_embeddings: true
+
+      model:
+        # the TRAINING base (de-distilled, CFG-capable)
+        name_or_path: "ostris/Z-Image-De-Turbo"
+        arch: "zimage"
+        # the COMPLETE diffusers repo that carries the Qwen3 text encoder, the
+        # tokenizer and the VAE — see the header
+        extras_name_or_path: "Tongyi-MAI/Z-Image-Turbo"
+        # 16 GB VRAM budget: quantize the transformer and the text encoder
+        quantize: true
+        qtype: "qfloat8"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: true
+
+      sample:
+        sampler: "flowmatch"          # must match train.noise_scheduler
+        sample_every: 250
+        width: 1024
+        height: 1024
+        # sampled on the De-Turbo BASE, so it uses real CFG. The shipped LoRA is
+        # then used in ComfyUI against Turbo at 8 steps / cfg 0 — a different
+        # sampler configuration by design.
+        guidance_scale: 4.0
+        sample_steps: 20
+        seed: 42
+        walk_seed: true
+        neg: ""
+        prompts:
+          - "a photo of a [trigger] cat sitting on a windowsill, soft morning light"
+          - "a [trigger] landscape, wide shot, dramatic clouds, golden hour"
