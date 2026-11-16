@@ -13,8 +13,8 @@ ai-toolkit:
             built UI entrypoints, the example config, and the live UI on port 8675.
         require:
             # CUDA runtime: ai-toolkit drives an NVIDIA GPU for every job.
-            - '@github.com/opencharly/layer-cuda:v2026.290.1513'
-            - '@github.com/opencharly/layer-supervisord:v2026.271.1817'
+            - '@github.com/opencharly/layer-cuda:v2026.314.0705'
+            - '@github.com/opencharly/layer-supervisord:v2026.314.0710'
             # Node >= 20 for the Next.js UI (built at image time, run by the services).
             - '@github.com/opencharly/layer-nodejs:v2026.314.0707'
         env:
