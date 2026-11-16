@@ -163,17 +163,22 @@ ai-toolkit:
                 cd /opt/ai-toolkit
                 exec python3 /opt/ai-toolkit/run.py "$@"
 
-            - run: write the start script that seeds the state volume, links it in, then execs the UI server
-              write: /opt/ai-toolkit/start-ui.sh
-              mode: "0755"
+            - run: write the ONE state-splice + schema helper both services source
+              # Extracted because BOTH start scripts need the identical block: splice
+              # config/output/datasets and the sqlite file into the volume, then create the schema
+              # under one lock. Two copies is the duplication R2 forbids, and the second copy is
+              # where a fix silently fails to land.
+              write: /opt/ai-toolkit/start-common.sh
+              mode: "0644"
               run_as: root
               content: |
                 #!/bin/bash
-                set -eu
+                # Sourced by start-ui.sh and start-worker.sh. Not run on its own.
+                #
                 # The APPLICATION lives in the image (/opt/ai-toolkit, pinned commit); the MUTABLE
-                # directories live in the `ai-toolkit` volume. ai-toolkit has no --base-directory flag
-                # (ComfyUI does), so the volume is spliced in by SYMLINK, created at RUNTIME because the
-                # volume only exists once the container starts.
+                # directories live in the `ai-toolkit` volume. ai-toolkit has no --base-directory
+                # flag (ComfyUI does), so the volume is spliced in by SYMLINK, created at RUNTIME
+                # because the volume only exists once the container starts.
                 BASE="${HOME}/ai-toolkit"
                 mkdir -p "${BASE}"/{config,output,datasets}
                 # share the LoRA shelf with the ComfyUI pod when one is mounted
@@ -188,21 +193,30 @@ ai-toolkit:
                   fi
                   ln -sfn "${BASE}/${d}" "/opt/ai-toolkit/${d}"
                 done
-                export AI_TOOLKIT_AUTH="${AI_TOOLKIT_AUTH:-}"
-                # The sqlite job database is at /opt/ai-toolkit/aitk_db.db (prisma/schema.prisma
+                # The sqlite job database sits at /opt/ai-toolkit/aitk_db.db (prisma/schema.prisma
                 # says file:../../aitk_db.db). Splice it into the volume like every other mutable
-                # byte, then create the schema. db push is idempotent and local — no network.
+                # byte, then create the schema — under ONE flock, because the worker queries Queue
+                # on its very first tick and does not wait for the UI: whichever service arrives
+                # first creates the tables and the other's push is a no-op. Without this the worker
+                # dies on every start with
+                #   code: 'P2021', meta: { modelName: 'Queue', table: 'main.Queue' }   (measured)
                 DB="${BASE}/aitk_db.db"
                 touch "${DB}"
                 ln -sfn "${DB}" /opt/ai-toolkit/aitk_db.db
                 cd /opt/ai-toolkit/ui
-                # BOTH services need the schema, and the worker queries Queue on its very first
-                # tick — it does not wait for this script. `flock` on one lock file makes the push
-                # a single serialized action: whichever service gets there first creates the
-                # tables and the other one's push is then a no-op. Without it the worker dies with
-                #   code: 'P2021', meta: { modelName: 'Queue', table: 'main.Queue' }
-                # on every start (measured).
                 flock "${BASE}/.aitk-db.lock" sh -c 'npx prisma db push --skip-generate'
+
+            - run: write the UI start script
+              write: /opt/ai-toolkit/start-ui.sh
+              mode: "0755"
+              run_as: root
+              content: |
+                #!/bin/bash
+                set -eu
+                # state splice + schema (shared with the worker)
+                . /opt/ai-toolkit/start-common.sh
+                export AI_TOOLKIT_AUTH="${AI_TOOLKIT_AUTH:-}"
+                cd /opt/ai-toolkit/ui
                 exec node dist/cron/fileServer.js start --port "${AI_TOOLKIT_PORT:-8675}"
 
             - run: write the start script for the job worker
@@ -212,24 +226,11 @@ ai-toolkit:
               content: |
                 #!/bin/bash
                 set -eu
-                # The worker is what actually launches `python run.py <config>` for a queued job. It
-                # resolves its interpreter via pythonPath.ts (no <root>/venv exists here, so it uses
-                # python3 on PATH — the pixi env). It must see the SAME symlinked app tree the UI does.
-                BASE="${HOME}/ai-toolkit"
-                mkdir -p "${BASE}"/{config,output,datasets}
-                for d in config output datasets; do
-                  if [ -e "/opt/ai-toolkit/${d}" ] && [ ! -L "/opt/ai-toolkit/${d}" ]; then
-                    rm -rf "/opt/ai-toolkit/${d}"
-                  fi
-                  ln -sfn "${BASE}/${d}" "/opt/ai-toolkit/${d}"
-                done
-                DB="${BASE}/aitk_db.db"
-                touch "${DB}"
-                ln -sfn "${DB}" /opt/ai-toolkit/aitk_db.db
+                # The worker is what launches `python run.py <config>` for a queued job. It resolves
+                # its interpreter via pythonPath.ts (no <root>/venv exists, so python3 on PATH — the
+                # pixi env), and must see the SAME spliced app tree the UI does.
+                . /opt/ai-toolkit/start-common.sh
                 cd /opt/ai-toolkit/ui
-                # same lock-guarded schema push as the UI: the worker queries Queue on its first
-                # tick, so it must not depend on the UI having got there first
-                flock "${BASE}/.aitk-db.lock" sh -c 'npx prisma db push --skip-generate'
                 exec node dist/cron/worker.js
 
             - check: the source tree is the PINNED commit, not whatever the default branch was that day
