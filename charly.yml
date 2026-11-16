@@ -87,8 +87,15 @@ ai-toolkit:
                 git checkout --detach "${AI_TOOLKIT_REF:?AI_TOOLKIT_REF must be declared by the candy}"
                 # a detached checkout at a pin is only trustworthy if the pin RESOLVED — a typo'd
                 # sha leaves the clone on the default branch and the build would ship the wrong code
-                test "$(git -c safe.directory=/opt/ai-toolkit rev-parse HEAD)" = "${AI_TOOLKIT_REF}"
+                test "$(git rev-parse HEAD)" = "${AI_TOOLKIT_REF}"
                 printf '%s\n' "${AI_TOOLKIT_REF}" > /opt/ai-toolkit/.charly-ref
+                # The tree is cloned as root but read at RUNTIME by the image user, and git
+                # refuses to read a repo owned by another uid ("dubious ownership"). One
+                # SYSTEM-level entry fixes every reader in the image at once (checks, the
+                # services, a shell); per-call `-c safe.directory=` flags would duplicate it
+                # into every consumer and drift. Scoped to this path, never `*`: a wildcard
+                # would disable the ownership check for every repo in the image.
+                git config --system --add safe.directory /opt/ai-toolkit
 
             - run: build the Next.js UI so the supervised launch is immediate
               run_as: root
@@ -138,6 +145,13 @@ ai-toolkit:
                 mkdir -p /opt/ai-toolkit/ui/.next/cache
                 chown user:user /opt/ai-toolkit /opt/ai-toolkit/ui
                 chown -R user:user /opt/ai-toolkit/ui/.next
+                # The state splice REMOVES the image's own config/output/datasets so the
+                # volume can replace them, and the service runs as `user`. Root-owned files
+                # there make that `rm` fail, and the launch script exits 1 under `set -e` —
+                # the service then dies "too quickly" with no message of its own. These three
+                # directories are small (yaml + empty dirs), so a recursive chown is cheap;
+                # it stays scoped to them, never the ~18 GB tree.
+                chown -R user:user /opt/ai-toolkit/config /opt/ai-toolkit/output /opt/ai-toolkit/datasets
 
             - run: keep the upstream example configs aside — the live config dir becomes a volume symlink
               run_as: root
@@ -247,11 +261,7 @@ ai-toolkit:
               command: |
                 set -eu
                 test -s /opt/ai-toolkit/.charly-ref
-                # git refuses to read a tree owned by another uid ("dubious ownership"), and the
-                # check runs as a different uid than the one that owns /opt/ai-toolkit at build
-                # time. Scope the exception to THIS path — never a global safe.directory=*.
-                test "$(cat /opt/ai-toolkit/.charly-ref)" = \
-                     "$(git -c safe.directory=/opt/ai-toolkit -C /opt/ai-toolkit rev-parse HEAD)"
+                test "$(cat /opt/ai-toolkit/.charly-ref)" = "$(git -C /opt/ai-toolkit rev-parse HEAD)"
               exit_status: 0
 
             - check: the image interpreter imports torch and the build-time CUDA stack
