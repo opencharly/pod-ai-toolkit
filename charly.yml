@@ -151,6 +151,9 @@ ai-toolkit:
                 # the service then dies "too quickly" with no message of its own. These three
                 # directories are small (yaml + empty dirs), so a recursive chown is cheap;
                 # it stays scoped to them, never the ~18 GB tree.
+                # output/ and datasets/ are created by the trainer at runtime, so they may not
+                # exist in the clone yet — create them first, or the chown fails the build.
+                mkdir -p /opt/ai-toolkit/output /opt/ai-toolkit/datasets
                 chown -R user:user /opt/ai-toolkit/config /opt/ai-toolkit/output /opt/ai-toolkit/datasets
 
             - run: keep the upstream example configs aside — the live config dir becomes a volume symlink
