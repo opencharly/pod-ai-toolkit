@@ -87,7 +87,7 @@ ai-toolkit:
                 git checkout --detach "${AI_TOOLKIT_REF:?AI_TOOLKIT_REF must be declared by the candy}"
                 # a detached checkout at a pin is only trustworthy if the pin RESOLVED — a typo'd
                 # sha leaves the clone on the default branch and the build would ship the wrong code
-                test "$(git rev-parse HEAD)" = "${AI_TOOLKIT_REF}"
+                test "$(git -c safe.directory=/opt/ai-toolkit rev-parse HEAD)" = "${AI_TOOLKIT_REF}"
                 printf '%s\n' "${AI_TOOLKIT_REF}" > /opt/ai-toolkit/.charly-ref
 
             - run: build the Next.js UI so the supervised launch is immediate
@@ -247,7 +247,11 @@ ai-toolkit:
               command: |
                 set -eu
                 test -s /opt/ai-toolkit/.charly-ref
-                test "$(cat /opt/ai-toolkit/.charly-ref)" = "$(git -C /opt/ai-toolkit rev-parse HEAD)"
+                # git refuses to read a tree owned by another uid ("dubious ownership"), and the
+                # check runs as a different uid than the one that owns /opt/ai-toolkit at build
+                # time. Scope the exception to THIS path — never a global safe.directory=*.
+                test "$(cat /opt/ai-toolkit/.charly-ref)" = \
+                     "$(git -c safe.directory=/opt/ai-toolkit -C /opt/ai-toolkit rev-parse HEAD)"
               exit_status: 0
 
             - check: the image interpreter imports torch and the build-time CUDA stack
