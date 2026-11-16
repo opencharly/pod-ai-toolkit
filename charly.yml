@@ -124,11 +124,20 @@ ai-toolkit:
               run_as: root
               command: |
                 set -eu
+                # TARGETED, not a recursive chown over the whole tree. Two reasons:
+                #   1. at runtime the ONLY paths the image user writes are the top-level dir
+                #      (the start script removes config/ and re-creates the volume symlinks in
+                #      it) and Next.js's own cache -- everything else is read-only app code;
+                #   2. a recursive chown over an ~18 GB tree forces a copy-up of every file,
+                #      tens of thousands of node_modules entries among them, for no benefit --
+                #      and it is the last heavy step before image export.
                 # by NAME, not "${UID}:${GID}": the step runs under /bin/sh, where UID is not a
                 # special shell variable, and `set -u` makes an unset reference abort the step
-                # (measured: the build died on this line). `user` is the image user every
+                # (measured: the build died on that line). `user` is the image user every
                 # opencharly GPU base creates.
-                chown -R user:user /opt/ai-toolkit
+                mkdir -p /opt/ai-toolkit/ui/.next/cache
+                chown user:user /opt/ai-toolkit /opt/ai-toolkit/ui
+                chown -R user:user /opt/ai-toolkit/ui/.next
 
             - run: keep the upstream example configs aside — the live config dir becomes a volume symlink
               run_as: root
