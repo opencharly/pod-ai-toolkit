@@ -293,7 +293,7 @@ ai-toolkit:
                 - runtime
               stdout:
                 - contains: zimage
-              command: python3 -c "from extensions_built_in.diffusion_models.z_image.z_image import ZImageModel; print(ZImageModel.arch)"
+              command: cd /opt/ai-toolkit && python3 -c "from extensions_built_in.diffusion_models.z_image.z_image import ZImageModel; print(ZImageModel.arch)"
               exit_status: 0
 
             - check: the UI was built, so the supervised launch does not build anything at start
