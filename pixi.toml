@@ -1,24 +1,94 @@
 [workspace]
 name = "ai-toolkit-environment"
 version = "0.1.0"
-description = "Python 3.12 interpreter that the Ostris AI Toolkit runtime venv is built from"
+description = "Ostris AI Toolkit runtime environment: Qwen3/DiT training stack on torch cu130"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
-# The interpreter ONLY.
+# ai-toolkit's dependency set, resolved by pixi.
 #
-# ai-toolkit's own dependency set is deliberately NOT declared here. Upstream pins
-# a git revision of diffusers alongside torchao/transformers/peft versions that
-# are solved together (and re-solved by upstream on its own cadence), so this pod
-# builds ai-toolkit's runtime venv from the pinned commit's own requirements.txt
-# at image-build time — the same shape pod-unsloth-studio uses for the Unsloth
-# Studio runtime venv. What pixi owns is the thing that must be reproducible and
-# is NOT upstream's business: the Python MINOR VERSION. ai-toolkit requires
-# >=3.10 and recommends 3.12, and the Arch host python is newer than the wheels
-# torch ships.
+# This is the SAME shape pod-comfyui uses for ComfyUI's environment (conda
+# interpreter + `[pypi-dependencies]` against the PyTorch cu130 wheel index), and
+# `pixi.lock` beside this file pins every wheel, so the image is reproducible
+# rather than "whatever pip resolved that day".
+#
+# Why not `pip install -r requirements.txt` in a venv: it was tried and it is not
+# merely slower here, it is unreliable — pip's downloads stalled repeatedly at
+# multi-hundred-MB CUDA wheels (measured twice: 50 min of silence at a byte-count
+# of ZERO over 45 s while the step's process was still alive). pixi's resolver and
+# fetcher completed the identical set. The set below is upstream's
+# requirements.txt, including its GIT-PINNED diffusers revision — that pin is what
+# carries Z-Image support, so it is reproduced exactly.
+#
+# Re-solving: edit this file and re-run `pixi lock` in a builder image. Do NOT
+# "upgrade everything"; ai-toolkit's own pins (transformers, peft, lycoris-lora,
+# torchao, the diffusers rev) are what its handlers are written against.
+
 [dependencies]
-python = "==3.12.*"
+python = "3.12.*"          # upstream requires >=3.10 and recommends 3.12
 pip = "*"
+
+[pypi-dependencies]
+# --- PyTorch CUDA 13.0 (upstream's pinned triple) ---
+torch = { version = "==2.13.0", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "==0.28.0", index = "https://download.pytorch.org/whl/cu130" }
+torchaudio = { version = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" }
+
+# --- diffusion training core, pinned exactly as upstream pins it ---
+# the git revision of diffusers is what carries ZImagePipeline (and therefore every
+# Z-Image job); the ai-toolkit-diffusers-zimage check is the canary for it
+diffusers = { git = "https://github.com/huggingface/diffusers.git", rev = "c943837899b16cbae2f619b8dd4f7bb6f07dd81a" }
+transformers = "==5.5.3"
+peft = "==0.18.1"
+lycoris-lora = "==1.8.3"       # LoKr / LyCORIS network types
+torchao = "==0.10.0"           # quantization (qfloat8 and friends)
+optimum-quanto = "==0.2.4"
+huggingface-hub = "==1.23.0"
+accelerate = "*"
+safetensors = "*"
+timm = "==1.0.22"
+controlnet-aux = "==0.0.10"
+open-clip-torch = "*"
+
+# --- datasets / image handling ---
+albumentations = "==1.4.15"
+albucore = "==0.0.16"
+opencv-python = "*"
+invisible-watermark = "*"
+pytorch-wavelets = "==1.3.0"
+flatten-json = "*"
+
+# --- video / audio families (Wan, LTX, ACE-Step) ---
+av = "==16.0.1"
+torchcodec = "==0.15.0"
+librosa = "==0.11.0"
+mutagen = "==1.47.0"
+
+# --- metrics / logging / UI ---
+pytorch-fid = "*"
+lpips = "*"
+tensorboard = "*"
+matplotlib = "==3.10.1"
+gradio = "*"
+fastapi = ">=0.115"
+uvicorn = ">=0.30"
+python-slugify = "*"
+
+# --- misc upstream requirements ---
+scipy = "==1.12.0"
+bitsandbytes = "*"
+hf-transfer = "*"
+prodigyopt = "*"
+kornia = "*"
+einops = "*"
+omegaconf = "*"
+pydantic = "*"
+sentencepiece = "*"
+pyyaml = "*"
+oyaml = "*"
+toml = "*"
+python-dotenv = "*"
+setuptools = ">=77.0.3"
 
 [environments]
 default = { features = [], solve-group = "default" }

@@ -3,18 +3,21 @@ ai-toolkit:
         description: |
             Ostris AI Toolkit diffusion-model training server — the GUI on port 8675 plus the CLI trainer
             (`ai-toolkit-train <config.yml>`). Clones ai-toolkit at a PINNED COMMIT (upstream publishes no
-            tags at all, so a commit is the only pinnable ref), builds its runtime venv at image-build time
-            from that commit's own requirements.txt against the pinned torch cu130 wheel index, builds the
+            tags at all, so a commit is the only pinnable ref), resolves its dependency set with pixi
+            (torch cu130 + the git-pinned diffusers revision that carries Z-Image), builds the
             Next.js UI, and supervises the UI server and its job worker as two services. The mutable state —
             configs, datasets, output — lives in the `ai-toolkit` volume; the application stays in the image
             at /opt/ai-toolkit. Ships a Z-Image LoRA example config that trains on ostris/Z-Image-De-Turbo
             and infers on Tongyi-MAI/Z-Image-Turbo. Each piece is verifiable: the cloned tree at the pinned
-            commit, a venv torch that reports a CUDA device, a diffusers whose ZImagePipeline exists, the
+            commit, a torch that reports a CUDA device, a diffusers whose ZImagePipeline exists, the
             built UI entrypoints, the example config, and the live UI on port 8675.
         require:
             # CUDA runtime: ai-toolkit drives an NVIDIA GPU for every job.
             - '@github.com/opencharly/layer-cuda:v2026.314.0705'
-            - '@github.com/opencharly/layer-supervisord:v2026.314.0710'
+            # NO explicit layer-supervisord pin: pinning it HERE makes `box validate` fail
+            # with "layer-supervisord resolved to multiple git tags with differing content"
+            # (box=ai-toolkit) — another candy in this box already requires it at a
+            # version this pin disagrees with. The box composes it transitively.
             # Node >= 20 for the Next.js UI (built at image time, run by the services).
             - '@github.com/opencharly/layer-nodejs:v2026.314.0707'
         env:
@@ -60,20 +63,23 @@ ai-toolkit:
             # TWO services, not one `concurrently` wrapper: the UI server and its job worker fail
             # and restart independently, and supervisord tracks two real PIDs instead of one wrapper
             # that would leave an untracked grandchild behind (measured in this org on unsloth-studio).
+            # ORDER MATTERS: the UI starts first because it is the one that initialises the sqlite
+            # job database (prisma db push). Two concurrent writers on a sqlite file is a race, so
+            # the worker is told to start later rather than racing it.
             - name: ai-toolkit-ui
               exec: /opt/ai-toolkit/start-ui.sh
               restart: always
               working_directory: /opt/ai-toolkit/ui
               enable: true
               scope: system
-              priority: 20
+              priority: 10
             - name: ai-toolkit-worker
               exec: /opt/ai-toolkit/start-worker.sh
               restart: always
               working_directory: /opt/ai-toolkit/ui
               enable: true
               scope: system
-              priority: 10
+              priority: 20
         plan:
             - run: clone ai-toolkit at the pinned COMMIT into the image-owned app directory
               run_as: root
@@ -86,27 +92,13 @@ ai-toolkit:
                 # sha leaves the clone on the default branch and the build would ship the wrong code
                 test "$(git rev-parse HEAD)" = "${AI_TOOLKIT_REF}"
                 printf '%s\n' "${AI_TOOLKIT_REF}" > /opt/ai-toolkit/.charly-ref
-
-            - run: build the ai-toolkit runtime venv from its own pinned requirements against torch cu130
-              # ai-toolkit ships a pinned requirements set that includes a GIT revision of diffusers;
-              # it is solved as a unit by upstream and re-solved on upstream's cadence, so the venv is
-              # built from that exact file rather than re-expressed in pixi (same shape pod-unsloth-studio
-              # uses for the Unsloth Studio runtime venv). pixi owns the PYTHON MINOR VERSION only.
-              run_as: root
-              cache:
-                - /root/.cache/pip
-              command: |
-                set -eu
-                cd /opt/ai-toolkit
-                python3 -m venv venv
-                ./venv/bin/python -m pip install --upgrade pip wheel setuptools
-                ./venv/bin/pip install --no-cache-dir \
-                  torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
-                  --index-url https://download.pytorch.org/whl/cu130
-                ./venv/bin/pip install --no-cache-dir -r requirements.txt
-                # fail the build loudly: a silently broken venv would only surface as a
-                # supervisord FATAL at deploy time
-                ./venv/bin/python -c "import torch; print('torch', torch.__version__)"
+                # The tree is cloned as root but read at RUNTIME by the image user, and git
+                # refuses to read a repo owned by another uid ("dubious ownership"). One
+                # SYSTEM-level entry fixes every reader in the image at once (checks, the
+                # services, a shell); per-call `-c safe.directory=` flags would duplicate it
+                # into every consumer and drift. Scoped to this path, never `*`: a wildcard
+                # would disable the ownership check for every repo in the image.
+                git config --system --add safe.directory /opt/ai-toolkit
 
             - run: build the Next.js UI so the supervised launch is immediate
               run_as: root
@@ -116,15 +108,56 @@ ai-toolkit:
                 set -eu
                 cd /opt/ai-toolkit/ui
                 npm ci
+                # npm is NOT running dependency install scripts here (it reports
+                #   npm warn install-scripts   sqlite3@6.0.1 (install: prebuild-install -r napi || node-gyp rebuild)
+                # and then leaves the binding absent), so BOTH native build artifacts have to be
+                # produced explicitly. This is not a workaround for a broken package: it is the same
+                # command the package's own install script runs, invoked where a supervised build can
+                # see it fail.
+                #   - Prisma's client: upstream's `npm run build` (tsc && next build) never generates
+                #     it, so the type check dies with
+                #       error TS2305: Module '"@prisma/client"' has no exported member 'PrismaClient'
+                npx prisma generate
+                #   - sqlite3's native binding: without it `next build` dies collecting page data for
+                #     /api/jobs/[jobID]/loss (measured: node-v147-linux-x64/node_sqlite3.node missing).
+                #     prebuild-install fetches a N-API prebuilt; node-gyp rebuild compiles it against
+                #     the nodejs layer's headers when no prebuilt exists for this ABI.
+                ( cd node_modules/sqlite3 && ( npx --yes prebuild-install -r napi || npx --yes node-gyp rebuild ) )
                 npm run build
                 test -s dist/cron/fileServer.js
                 test -s dist/cron/worker.js
+                # both native artifacts are build outputs, not npm dependencies — assert them
+                test -d node_modules/.prisma/client
+                test -f node_modules/sqlite3/build/Release/node_sqlite3.node -o -f node_modules/sqlite3/lib/binding/*/node_sqlite3.node
 
             - run: hand the app tree to the image user so the UI can write its own runtime state
               run_as: root
               command: |
                 set -eu
-                chown -R "${UID}:${GID}" /opt/ai-toolkit
+                # TARGETED, not a recursive chown over the whole tree. Two reasons:
+                #   1. at runtime the ONLY paths the image user writes are the top-level dir
+                #      (the start script removes config/ and re-creates the volume symlinks in
+                #      it) and Next.js's own cache -- everything else is read-only app code;
+                #   2. a recursive chown over an ~18 GB tree forces a copy-up of every file,
+                #      tens of thousands of node_modules entries among them, for no benefit --
+                #      and it is the last heavy step before image export.
+                # by NAME, not "${UID}:${GID}": the step runs under /bin/sh, where UID is not a
+                # special shell variable, and `set -u` makes an unset reference abort the step
+                # (measured: the build died on that line). `user` is the image user every
+                # opencharly GPU base creates.
+                mkdir -p /opt/ai-toolkit/ui/.next/cache
+                chown user:user /opt/ai-toolkit /opt/ai-toolkit/ui
+                chown -R user:user /opt/ai-toolkit/ui/.next
+                # The state splice REMOVES the image's own config/output/datasets so the
+                # volume can replace them, and the service runs as `user`. Root-owned files
+                # there make that `rm` fail, and the launch script exits 1 under `set -e` —
+                # the service then dies "too quickly" with no message of its own. These three
+                # directories are small (yaml + empty dirs), so a recursive chown is cheap;
+                # it stays scoped to them, never the ~18 GB tree.
+                # output/ and datasets/ are created by the trainer at runtime, so they may not
+                # exist in the clone yet — create them first, or the chown fails the build.
+                mkdir -p /opt/ai-toolkit/output /opt/ai-toolkit/datasets
+                chown -R user:user /opt/ai-toolkit/config /opt/ai-toolkit/output /opt/ai-toolkit/datasets
 
             - run: keep the upstream example configs aside — the live config dir becomes a volume symlink
               run_as: root
@@ -151,25 +184,30 @@ ai-toolkit:
               run_as: root
               content: |
                 #!/bin/bash
-                # Run ai-toolkit with ITS OWN venv, from ITS OWN root, regardless of the caller's PATH
-                # or cwd — the UI worker resolves the venv itself, but a human or an agent running the
-                # CLI should get the same interpreter.
+                # Run ai-toolkit from ITS OWN root with the image's pixi-interpreted python, so a
+                # human or an agent running the CLI gets the same environment the UI worker does
+                # (pythonPath.ts falls back to python3 on PATH, which IS the pixi env).
                 set -eu
                 export AI_TOOLKIT_ROOT=/opt/ai-toolkit
                 cd /opt/ai-toolkit
-                exec /opt/ai-toolkit/venv/bin/python /opt/ai-toolkit/run.py "$@"
+                exec python3 /opt/ai-toolkit/run.py "$@"
 
-            - run: write the start script that seeds the state volume, links it in, then execs the UI server
-              write: /opt/ai-toolkit/start-ui.sh
-              mode: "0755"
+            - run: write the ONE state-splice + schema helper both services source
+              # Extracted because BOTH start scripts need the identical block: splice
+              # config/output/datasets and the sqlite file into the volume, then create the schema
+              # under one lock. Two copies is the duplication R2 forbids, and the second copy is
+              # where a fix silently fails to land.
+              write: /opt/ai-toolkit/start-common.sh
+              mode: "0644"
               run_as: root
               content: |
                 #!/bin/bash
-                set -eu
+                # Sourced by start-ui.sh and start-worker.sh. Not run on its own.
+                #
                 # The APPLICATION lives in the image (/opt/ai-toolkit, pinned commit); the MUTABLE
-                # directories live in the `ai-toolkit` volume. ai-toolkit has no --base-directory flag
-                # (ComfyUI does), so the volume is spliced in by SYMLINK, created at RUNTIME because the
-                # volume only exists once the container starts.
+                # directories live in the `ai-toolkit` volume. ai-toolkit has no --base-directory
+                # flag (ComfyUI does), so the volume is spliced in by SYMLINK, created at RUNTIME
+                # because the volume only exists once the container starts.
                 BASE="${HOME}/ai-toolkit"
                 mkdir -p "${BASE}"/{config,output,datasets}
                 # share the LoRA shelf with the ComfyUI pod when one is mounted
@@ -184,6 +222,28 @@ ai-toolkit:
                   fi
                   ln -sfn "${BASE}/${d}" "/opt/ai-toolkit/${d}"
                 done
+                # The sqlite job database sits at /opt/ai-toolkit/aitk_db.db (prisma/schema.prisma
+                # says file:../../aitk_db.db). Splice it into the volume like every other mutable
+                # byte, then create the schema — under ONE flock, because the worker queries Queue
+                # on its very first tick and does not wait for the UI: whichever service arrives
+                # first creates the tables and the other's push is a no-op. Without this the worker
+                # dies on every start with
+                #   code: 'P2021', meta: { modelName: 'Queue', table: 'main.Queue' }   (measured)
+                DB="${BASE}/aitk_db.db"
+                touch "${DB}"
+                ln -sfn "${DB}" /opt/ai-toolkit/aitk_db.db
+                cd /opt/ai-toolkit/ui
+                flock "${BASE}/.aitk-db.lock" sh -c 'npx prisma db push --skip-generate'
+
+            - run: write the UI start script
+              write: /opt/ai-toolkit/start-ui.sh
+              mode: "0755"
+              run_as: root
+              content: |
+                #!/bin/bash
+                set -eu
+                # state splice + schema (shared with the worker)
+                . /opt/ai-toolkit/start-common.sh
                 export AI_TOOLKIT_AUTH="${AI_TOOLKIT_AUTH:-}"
                 cd /opt/ai-toolkit/ui
                 exec node dist/cron/fileServer.js start --port "${AI_TOOLKIT_PORT:-8675}"
@@ -195,17 +255,10 @@ ai-toolkit:
               content: |
                 #!/bin/bash
                 set -eu
-                # The worker is what actually launches `python run.py <config>` for a queued job. It
-                # resolves the interpreter from <root>/venv/bin/python, which is exactly where the
-                # build put it — so it must see the SAME symlinked app tree the UI does.
-                BASE="${HOME}/ai-toolkit"
-                mkdir -p "${BASE}"/{config,output,datasets}
-                for d in config output datasets; do
-                  if [ -e "/opt/ai-toolkit/${d}" ] && [ ! -L "/opt/ai-toolkit/${d}" ]; then
-                    rm -rf "/opt/ai-toolkit/${d}"
-                  fi
-                  ln -sfn "${BASE}/${d}" "/opt/ai-toolkit/${d}"
-                done
+                # The worker is what launches `python run.py <config>` for a queued job. It resolves
+                # its interpreter via pythonPath.ts (no <root>/venv exists, so python3 on PATH — the
+                # pixi env), and must see the SAME spliced app tree the UI does.
+                . /opt/ai-toolkit/start-common.sh
                 cd /opt/ai-toolkit/ui
                 exec node dist/cron/worker.js
 
@@ -217,11 +270,11 @@ ai-toolkit:
                 test "$(cat /opt/ai-toolkit/.charly-ref)" = "$(git -C /opt/ai-toolkit rev-parse HEAD)"
               exit_status: 0
 
-            - check: the venv imports torch and the build-time CUDA stack
-              id: ai-toolkit-venv-torch
+            - check: the image interpreter imports torch and the build-time CUDA stack
+              id: ai-toolkit-torch
               stdout:
                 - contains: torch
-              command: /opt/ai-toolkit/venv/bin/python -c "import torch; print('torch', torch.__version__)"
+              command: python3 -c "import torch; print('torch', torch.__version__)"
               exit_status: 0
 
             - check: the pinned diffusers actually carries ZImagePipeline — the whole Z-Image path depends on it
@@ -230,14 +283,20 @@ ai-toolkit:
               id: ai-toolkit-diffusers-zimage
               stdout:
                 - contains: ZImagePipeline
-              command: /opt/ai-toolkit/venv/bin/python -c "from diffusers import ZImagePipeline; print('ZImagePipeline')"
+              command: python3 -c "from diffusers import ZImagePipeline; print('ZImagePipeline')"
               exit_status: 0
 
             - check: the Z-Image model handler ai-toolkit will use for arch=zimage is importable
+              # RUNTIME context: importing the handler walks the extensions package, whose
+              # OmniGen2 module calls torch.cuda.get_device_properties AT IMPORT TIME, so a
+              # build-scope probe dies with "RuntimeError: No CUDA GPUs are available" even
+              # though the handler itself is fine (measured).
               id: ai-toolkit-zimage-handler
+              context:
+                - runtime
               stdout:
                 - contains: zimage
-              command: /opt/ai-toolkit/venv/bin/python -c "from extensions_built_in.diffusion_models.z_image.z_image import ZImageModel; print(ZImageModel.arch)"
+              command: cd /opt/ai-toolkit && python3 -c "from extensions_built_in.diffusion_models.z_image.z_image import ZImageModel; print(ZImageModel.arch)"
               exit_status: 0
 
             - check: the UI was built, so the supervised launch does not build anything at start
@@ -246,13 +305,22 @@ ai-toolkit:
                 file: /opt/ai-toolkit/ui/dist/cron/fileServer.js
                 exists: true
 
+            - check: the Prisma client was GENERATED — it is a build artifact, not an npm dependency
+              # The UI type-checks against @prisma/client's generated client at node_modules/.prisma.
+              # A plain `npm ci` leaves it absent and the build fails; this check pins the fact that
+              # the generation step ran, so a future edit to the build step cannot silently drop it.
+              id: ai-toolkit-prisma-client
+              file:
+                file: /opt/ai-toolkit/ui/node_modules/.prisma/client
+                exists: true
+
             - check: the shipped Z-Image LoRA example config is present in the image
               id: ai-toolkit-zimage-config
               file:
                 file: /opt/ai-toolkit/config.examples/z-image-lora-de-turbo.yml
                 exists: true
 
-            - check: the CLI trainer wrapper execs the venv
+            - check: the CLI trainer wrapper execs the image interpreter
               id: ai-toolkit-train-wrapper
               file:
                 file: /usr/local/bin/ai-toolkit-train
