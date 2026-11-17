@@ -14,7 +14,7 @@ ai-toolkit:
         require:
             # CUDA runtime: ai-toolkit drives an NVIDIA GPU for every job.
             - '@github.com/opencharly/layer-cuda:v2026.314.0705'
-            - '@github.com/opencharly/layer-supervisord:v2026.314.0710'
+            - '@github.com/opencharly/layer-supervisord:e51925f57926f159b123a0935bfdd59911914b8b'
             # Node >= 20 for the Next.js UI (built at image time, run by the services).
             - '@github.com/opencharly/layer-nodejs:v2026.314.0707'
         env:
