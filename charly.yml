@@ -14,7 +14,10 @@ ai-toolkit:
         require:
             # CUDA runtime: ai-toolkit drives an NVIDIA GPU for every job.
             - '@github.com/opencharly/layer-cuda:v2026.314.0705'
-            - '@github.com/opencharly/layer-supervisord:v2026.314.0710'
+            # NO explicit layer-supervisord pin: pinning it HERE makes `box validate` fail
+            # with "layer-supervisord resolved to multiple git tags with differing content"
+            # (box=ai-toolkit) — another candy in this box already requires it at a
+            # version this pin disagrees with. The box composes it transitively.
             # Node >= 20 for the Next.js UI (built at image time, run by the services).
             - '@github.com/opencharly/layer-nodejs:v2026.314.0707'
         env:
