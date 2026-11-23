@@ -1,3 +1,10 @@
+---
+name: ai-toolkit
+description: 'Ostris AI Toolkit diffusion training pod (GUI 8675 + CLI trainer), and the
+  Z-Image LoRA path. MUST be invoked before building, deploying, configuring, or
+  troubleshooting the ai-toolkit pod.'
+---
+
 # ai-toolkit — the training pod, and the Z-Image LoRA path
 
 Operator skill for the `ai-toolkit` pod: Ostris AI Toolkit serving its GUI on **8675** plus the
