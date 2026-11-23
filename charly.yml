@@ -12,8 +12,13 @@ ai-toolkit:
             commit, a torch that reports a CUDA device, a diffusers whose ZImagePipeline exists, the
             built UI entrypoints, the example config, and the live UI on port 8675.
         require:
-            # CUDA runtime: ai-toolkit drives an NVIDIA GPU for every job.
-            - '@github.com/opencharly/layer-cuda:v2026.314.0705'
+            # NO `layer-cuda` entry: ai-toolkit drives an NVIDIA GPU, but the CUDA substrate
+            # belongs to the BOX, not to this candy (opencharly/layer-cuda#34 item 6, the
+            # precedent opencharly/pod-comfyui#24 set). A `require:` is target-blind — it
+            # asserted the GPU stack for EVERY consumer, so a CPU box dragged a toolkit it
+            # cannot use and a CDI pod re-composed a substrate its base had applied. The
+            # `ai-toolkit-cdi` box bases on `podcdi.pod-cdi`, which composes `layer-cdi` →
+            # `layer-cuda`.
             # NO explicit layer-supervisord pin: pinning it HERE makes `box validate` fail
             # with "layer-supervisord resolved to multiple git tags with differing content"
             # (box=ai-toolkit) — another candy in this box already requires it at a
