@@ -357,9 +357,6 @@ ai-toolkit-skill:
         name: ai-toolkit
         family: ai-toolkit
         owner: ai-toolkit
-        description: |-
-            Ostris AI Toolkit diffusion training pod (GUI 8675 + CLI trainer), and the Z-Image LoRA path.
-            MUST be invoked before building, deploying, configuring, or troubleshooting the ai-toolkit pod.
 
 # The verb/schema skills this repo's own candy owns — routing only. The prose is the skill FILE at
 # `<repo root>/.agents/skills/<name>/SKILL.md`, never an inline description: an inline body that
