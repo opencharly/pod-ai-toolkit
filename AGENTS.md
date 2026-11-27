@@ -5,9 +5,14 @@ This file adds only what is specific to **this** repo.
 
 ## What this repo is
 
-A **pod-class** repo (`pod-*`): it owns the `ai-toolkit` **candy** and the two skills that
-describe it. It deliberately ships **no image** — the image that composes this candy lives in
-`distro-cachyos` / `distro-fedora` beside `pod-comfyui`'s, so both pods are built the same way.
+A **pod-class** repo (`pod-*`): it owns the `ai-toolkit` **candy**, the two skills that describe
+it, AND the image that composes it — `box/ai-toolkit-cdi/charly.yml` (the `podcdi.pod-cdi` base
+composing the LOCAL candy) plus its disposable R10 bed `check-cachyos-ai-toolkit-pod` in
+`charly.yml`. The box and the bed live here with the service they test: a `distro-*` repo holds
+the distro family, not one service's box (umbrella `AGENTS.md`, "Repo classes and naming").
+
+The class rule cuts both ways: the box composes the LOCAL `ai-toolkit` candy, never a pinned
+release of this repo, so a bed run proves the tree under change.
 
 Class rule: a pod repo carries a pod's candy, its skills beside that candy, and nothing that
 belongs to another class.
