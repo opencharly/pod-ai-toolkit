@@ -64,6 +64,14 @@ ai-toolkit:
             # ComfyUI pod mounts at models/loras — a nested mount over this volume.
             - name: workspace
               path: "/workspace"
+            # The XDG cache home. A training run pulls the Z-Image base, its text encoder and
+            # tokenizer/VAE through HuggingFace (`diffusers` + `huggingface_hub`, HF_HOME
+            # defaulting to $XDG_CACHE_HOME/huggingface) and torch's downloads through TORCH_HOME
+            # (default $XDG_CACHE_HOME/torch). With no volume there, every re-created container
+            # re-downloads those multi-GB weights. One volume over the cache home covers both,
+            # and no HF_HOME/TORCH_HOME is pinned: both derive from HOME, the image home.
+            - name: cache
+              path: "~/.cache"
         service:
             # TWO services, not one `concurrently` wrapper: the UI server and its job worker fail
             # and restart independently, and supervisord tracks two real PIDs instead of one wrapper
@@ -354,6 +362,29 @@ ai-toolkit:
                   test -L "/opt/ai-toolkit/$d" || { echo "/opt/ai-toolkit/$d is not a volume symlink" >&2; exit 1; }
                   test -d "$HOME/ai-toolkit/$d" || { echo "$HOME/ai-toolkit/$d is missing" >&2; exit 1; }
                 done
+              exit_status: 0
+
+            - check: the model caches sit on the persisted XDG cache volume, so a re-created container starts warm
+              id: ai-toolkit-cache-on-the-volume
+              context:
+                - runtime
+              command: |
+                set -eu
+                cache="$HOME/.cache"
+                if ! grep -q " ${cache} " /proc/self/mountinfo; then
+                  echo "$cache is not a mount: the model caches are in the container layer and will be re-fetched" >&2
+                  exit 1
+                fi
+                # the cache resolver must name a path under that mount
+                py=/opt/ai-toolkit/venv/bin/python
+                [ -x "$py" ] || py=python3
+                hf=$("$py" -c 'import huggingface_hub.constants as c; print(c.HF_HOME)')
+                echo "HF_HOME=$hf"
+                case "$hf" in
+                  "$cache"/*) echo "HuggingFace resolves under the persisted cache volume" ;;
+                  *) echo "$hf is outside $cache" >&2; exit 1 ;;
+                esac
+                du -sh "$cache" 2>/dev/null || echo "not populated yet (first start)"
               exit_status: 0
 
 
